@@ -1,0 +1,271 @@
+Service Document Discovery
+--------------------------
+
+(See Service-Document.png)
+
+When creating a new repository connection, it should be possible to auto-
+discover the service document (SD-IRI) by checking the headers of the 
+repository web page given, as per SWORD section 13.
+
+- Implementation Notes
+
+It will be necessary for the DataBank home page to properly expose the SD-IRI
+as per the SWORD spec.
+
+
+Collection Selection
+--------------------
+
+(See Service-Document.png)
+
+SWORD Collections map perfectly onto DataBank silos and their behaviours:
+
+1/ A request to the SD-IRI will return a list of collections (silos) that the
+authenticating user can deposit to
+
+2/ A request to the Col-IRI (the silo's deposit IRI) will return a list of 
+all of the datasets in that silo (optionally limited to those deposited by the
+authenticating user)
+
+- Implementation Notes
+
+It seems likely that the same code which currently provides the DataBank API
+can be used for this functionality, and the only change is the serialisation
+of the response to a SWORD format
+
+
+Preflight submission
+--------------------
+
+(See DepositProcess.png)
+
+This creates a new container in DataBank, ready to take content in the form
+of the BagIt package.  The container will be empty of content at this stage
+but will have the metadata provided by the submission form already included.
+
+A successful response will return an Edit-IRI (the item's primary stable 
+identifier in DataBank) and a Deposit Receipt.
+
+- Operation:
+
+POST atom:entry to Col-IRI (SWORD 6.3.3)
+
+- HTTP headers:
+
+Content-Type: application/atom+xml;type=entry
+Slug: <dataset identifier>
+
+- Message body:
+
+<atom:entry>
+    <... metadata from submission form ...>
+</atom:entry>
+
+- On Error:
+
+Since we're working synchronously here, any error will be a permanent failure,
+and the user will have to try again.  If the error is communication (e.g. 
+temporary network outage) then this won't be too serious.  There are more
+serious errors which SWORD can raise, which we shouldn't encounter in 
+DataStage -> DataBank submission, but which will need to be handled for the
+general case where DataStage or DataBank are switched out for an alternative
+client or server.
+
+- Implementation Notes:
+
+Just re-implement the existing preflight code with the SWORD client library.
+
+The Edit-IRI is the key to the SWORD API and must be stored in DataStage against
+the dataset for use later (See EntryDocument.png).
+
+Complete Submission
+-------------------
+
+(See DepositProcess.png)
+
+This delivers the content as a BagIt package to DataBank.  What the container
+does with this is currently unclear: it may just store the zip to be unpacked
+later, or it may unpack it immediately inline or via some asynchronous queue.
+
+The operation is to the EM-IRI, which can be obtained from the Deposit Receipt
+received in the first operation (See EntryDocument.png). The EM-IRI can be 
+obtained at any time in the future by requesting the Entry Document associated 
+with the deposit via the Edit-IRI 
+
+Note that this stage can be run repeatedly with subsequent packages with the
+result that the new content from DataStage will overwrite the existing content
+in DataBank (obviously with versioning).
+
+- Operation:
+
+PUT BagIt to EM-IRI (SWORD 6.5.1)
+
+- HTTP Headers
+
+Content-Type: application/zip
+Content-Disposition: filename="bagit.zip"
+Content-MD5: 12354656788978
+Packaging: http://www.dataflow.ox.ac.uk/packages/BagIt
+
+- Message body:
+
+<binary package>
+
+- On Error
+
+If this operation fails, it could be for a number of reasons.  One option is
+to put the item back on the Redis queue, especially if it is a communication
+error with DataBank (could be a temporary network issue).  Other issues might
+result in permanent failure of the deposit, and will need to be handled 
+generically.
+
+- Implementation Notes:
+
+Just re-implement the existing complete submission code with the SWORD client
+library.
+
+Deposit Error Handling
+----------------------
+
+(See DepositProcess.png)
+
+- 415 (Unsupported Media Type)
+
+This can occur if the Packaging format is not acceptable.
+
+Between DataBank and DataStage this error should never arise, as both sides
+will be working with the DataFlow BagIt format only.
+
+Between DataStage and X or Y and DataBank this is a permanent fatal error, and
+will require programmer intervention to fix
+
+- 406 (Not Acceptable)
+
+This can occur if the Content-Type is not acceptable
+
+Between DataBank and DataStage this error should never arise, as both sides
+will be working with application/zip only.
+
+Between DataStage and X or Y and DataBank this is a permanent fatal error, and
+will require programmer intervention to fix
+
+- 412 (Precondition Failed)
+
+This can occur if:
+    a/ the supplied checksum does not match the file
+    b/ On-Behalf-Of has been specified in the request, and the server does not
+        support mediation
+        
+In the case of (a):
+
+Between DataStage and DataBank, the item should be re-queued for submission
+on the redis queue, and an administrator should be alerted in case this is
+a technical fault with either of the servers.
+
+Between DataStage and X, behave as above
+
+Between Y and DataBank, the error recovery will depend on client Y.
+
+In the case of (b):
+
+- 400 (Bad Request)
+
+This can occur if there are any problems with the SWORD request (deviation from
+the standard, etc).
+
+In all cases this is a permanent, fatal error, and will require programmer 
+intervention to fix
+
+- 403 (Forbidden)
+
+This can occur if the On-Behalf-Of user is not recognised.
+
+Between DataStage and DataBank this error should never arise, as OAuth will
+be used rather than mediated deposit
+
+Between DataStage and X or Y and DataBank the resolution of the error will
+depend on the authentication approach.  It is likely that by default DataBank
+will not support mediated deposit, though, in which case this error should
+never arise, instead beign caught by a 412 (Precondition Failed).
+
+- 405 (Method Not Allowed)
+
+This can occur if the implementation of SWORD 2.0 is not complete, or if the
+server's workflow has closed down access to certain methods on the requested
+object, which is fully legitimate as per the specification.
+
+Between DataStage and DataBank this should never arise, as we will design the
+integration specifically for their behaviours
+
+Between DataStage and X or Y and DataBank this is a permanent, fatal error and
+will require programmer intervention to fix.
+
+- 413 (Request Entity Too Large)
+
+This can occur if the server deems the deposit package to be too large
+
+Between DataStage and DataBank there is no theoretical limit to the deposit
+size, and errors resulting from large requests are more likely to manifest as
+400 (Bad Request) errors thrown by the web server rather than the DataBank
+application.  This error should therefore never arise.
+
+Between DataStage and X or Y and DataBank this is a permanent, fatal error.  A
+fix would require the client-side to implement some mechanism for delivering
+the content in smaller package (which the SWORD protocol would support), but 
+this would be a breaking change from the DataFlow model.
+
+
+State Evaluation
+----------------
+
+(See Statement.png)
+
+When checking the state of the item in DataBank, the following statuses will
+be represented, with the associated actions:
+
+1/ Container created, content not yet deposited
+
+This means that the preflight_submission has taken place but the complete
+submission has not yet been carried out.
+
+Informational only; no action is necessary
+
+
+2/ Content deposited, not yet unzipped
+
+This means that the complete submission has taken place, but DataBank has not
+yet unpacked the deposited zip.
+
+Informational only; no action is necessary
+
+
+3/ Content deposited, unzipped
+
+This means that the complete submission has taken place and DataBank has 
+successfully unpacked the deposited zip.
+
+Informational only; no action is necessary
+
+
+4/ Content deposited, unzip failed
+
+This means that the complete submission has taken place and DataBank attempted
+to unpack the deposited zip, and encountered an error with the file.
+
+DataStage should re-queue the content for complete submission, replacing the
+broken content.
+
+DataBank should consider keeping a count of the number of consecutive errors 
+and inform an administrator/the user if there are repeated failures to 
+transfer a working zip file.
+
+
+5/ Content deleted (is this status necessary?)
+
+This means that the content that previously existed in the dataset has been
+deleted.
+
+Informational only; no action is necessary
+
+
+
